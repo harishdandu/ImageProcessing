@@ -4,9 +4,9 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0",
-    "build": "vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "dev": "node ./node_modules/vite/bin/vite.js --host 0.0.0.0",
+    "build": "node ./node_modules/vite/bin/vite.js build",
+    "preview": "node ./node_modules/vite/bin/vite.js preview --host 0.0.0.0"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",
