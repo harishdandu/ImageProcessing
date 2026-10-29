@@ -1,5 +1,16 @@
+import { parseAadhaarText } from './aadhaar-fields.js';
+
 let pdfjsPromise;
 let ocrWorkerPromise;
+
+async function recognizeText(source) {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = import('tesseract.js').then(({ createWorker }) => createWorker('eng', 1));
+  }
+  const worker = await ocrWorkerPromise;
+  const { data } = await worker.recognize(source);
+  return data.text || '';
+}
 
 async function getPdfJs() {
   if (!pdfjsPromise) {
@@ -95,12 +106,7 @@ export function loadImage(file) {
 export async function inspectCertificate(file) {
   const { image, url } = await loadImage(file);
   try {
-    if (!ocrWorkerPromise) {
-      ocrWorkerPromise = import('tesseract.js').then(({ createWorker }) => createWorker('eng', 1));
-    }
-    const worker = await ocrWorkerPromise;
-    const { data } = await worker.recognize(image);
-    const text = data.text || '';
+    const text = await recognizeText(image);
     const normalized = text.toLowerCase().replace(/\s+/g, ' ');
     const letters = normalized.match(/[a-z]{3,}/g) || [];
     const hasCredentialTerm = /\b(degree|certificate|diploma|bachelor|master|graduat\w*|conferred|awarded|undergraduate|postgraduate|marksheet|mark\s+sheet|transcript|statement\s+of\s+marks)\b/.test(normalized);
@@ -122,6 +128,158 @@ export async function inspectCertificate(file) {
       height: image.naturalHeight,
       text,
       fields: extractCertificateFields(text),
+    };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function pdfItemsToLines(items) {
+  const rows = [];
+  items.forEach((item) => {
+    if (!item.str || !String(item.str).trim() || !item.transform) return;
+    const y = item.transform[5];
+    const x = item.transform[4];
+    let row = rows.find((entry) => Math.abs(entry.y - y) < 2);
+    if (!row) {
+      row = { y, parts: [] };
+      rows.push(row);
+    }
+    row.parts.push({ x, str: item.str });
+  });
+  return rows
+    .sort((left, right) => right.y - left.y)
+    .map((row) => row.parts.sort((left, right) => left.x - right.x).map((part) => part.str).join(' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+async function openPdf(file) {
+  const pdfjsLib = await getPdfJs();
+  const task = pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
+  return task.promise;
+}
+
+export async function extractPdfText(file, maxPages = 4) {
+  const pdfDocument = await openPdf(file);
+  try {
+    const pagesRead = Math.min(pdfDocument.numPages, maxPages);
+    const parts = [];
+    for (let pageNumber = 1; pageNumber <= pagesRead; pageNumber += 1) {
+      const page = await pdfDocument.getPage(pageNumber);
+      const content = await page.getTextContent();
+      parts.push(pdfItemsToLines(content.items));
+    }
+    return { text: parts.filter(Boolean).join('\n'), pageCount: pdfDocument.numPages, pagesRead };
+  } finally {
+    await pdfDocument.destroy();
+  }
+}
+
+async function renderPdfPreviewFiles(file, maxPages) {
+  const pdfDocument = await openPdf(file);
+  try {
+    const pagesRead = Math.min(pdfDocument.numPages, maxPages);
+    const files = [];
+    const baseName = file.name.replace(/\.pdf$/i, '') || 'aadhaar';
+    for (let pageNumber = 1; pageNumber <= pagesRead; pageNumber += 1) {
+      const page = await pdfDocument.getPage(pageNumber);
+      const baseViewport = page.getViewport({ scale: 2 });
+      const scale = Math.min(1, 2600 / Math.max(baseViewport.width, baseViewport.height));
+      const viewport = page.getViewport({ scale: 2 * scale });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const context = canvas.getContext('2d', { alpha: false });
+      if (!context) throw new Error('Your browser could not render this PDF page.');
+      context.fillStyle = '#ffffff';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvas, canvasContext: context, viewport }).promise;
+      const blob = await canvasToJpeg(canvas, 0.92);
+      files.push(new File([blob], `${baseName}-page-${pageNumber}.jpg`, { type: 'image/jpeg' }));
+    }
+    return files;
+  } finally {
+    await pdfDocument.destroy();
+  }
+}
+
+async function ocrPdfPages(file, maxPages) {
+  const pdfDocument = await openPdf(file);
+  try {
+    const pagesRead = Math.min(pdfDocument.numPages, maxPages);
+    const parts = [];
+    for (let pageNumber = 1; pageNumber <= pagesRead; pageNumber += 1) {
+      const page = await pdfDocument.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 2 });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const context = canvas.getContext('2d', { alpha: false });
+      if (!context) throw new Error('Your browser could not render this PDF page.');
+      context.fillStyle = '#ffffff';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvas, canvasContext: context, viewport }).promise;
+      parts.push(await recognizeText(canvas));
+    }
+    return parts.filter(Boolean).join('\n');
+  } finally {
+    await pdfDocument.destroy();
+  }
+}
+
+export async function readAadhaar(file, onProgress = () => {}) {
+  onProgress('Preparing Aadhaar…');
+  let text = '';
+  let pageCount = 1;
+  let pagesRead = 1;
+  let sourceFiles = [file];
+
+  if (isPdfFile(file)) {
+    const extracted = await extractPdfText(file, 4);
+    pageCount = extracted.pageCount;
+    pagesRead = extracted.pagesRead;
+    text = extracted.text;
+    if (!parseAadhaarText(text).ok) {
+      onProgress('Reading Aadhaar text…');
+      const ocrText = await ocrPdfPages(file, pagesRead);
+      text = [text, ocrText].filter(Boolean).join('\n');
+    }
+    sourceFiles = await renderPdfPreviewFiles(file, pagesRead);
+  } else if (isHeicFile(file)) {
+    sourceFiles = [await prepareCertificateFile(file)];
+  }
+
+  onProgress('Removing empty margins…');
+  const trimmedPages = [];
+  for (const sourceFile of sourceFiles) trimmedPages.push(await cropEmptyMargins(sourceFile, 'certificate'));
+  const trimmed = trimmedPages[0];
+  const { image, url } = await loadImage(trimmed.file);
+  try {
+    if (!isPdfFile(file) || !parseAadhaarText(text).ok) {
+      onProgress('Reading Aadhaar text…');
+      const ocrText = await recognizeText(image);
+      text = [text, ocrText].filter(Boolean).join('\n');
+    }
+    const parsed = parseAadhaarText(text);
+    if (!parsed.ok) {
+      return { ok: false, message: parsed.message, width: image.naturalWidth, height: image.naturalHeight };
+    }
+    return {
+      ok: true,
+      fields: parsed.fields,
+      side: parsed.side,
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+      file: trimmed.file,
+      files: trimmedPages.map((page) => page.file),
+      marginsCropped: trimmed.cropped,
+      sourceWidth: trimmed.sourceWidth,
+      sourceHeight: trimmed.sourceHeight,
+      contentWidth: trimmed.width || image.naturalWidth,
+      contentHeight: trimmed.height || image.naturalHeight,
+      pagesRead,
+      pageCount,
     };
   } finally {
     URL.revokeObjectURL(url);
